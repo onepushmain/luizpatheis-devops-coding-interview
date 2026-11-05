@@ -1,0 +1,14 @@
+**/__pycache__
+**/*.py[cod]
+**/.pytest_cache
+.venv
+.env
+.env.*
+.git
+.github
+deploy
+docs
+api/tests
+*.md
+gha-creds-*.json
+.gitignore

@@ -1,0 +1,42 @@
+{{- if .Values.networkPolicy.enabled -}}
+{{- if not .Values.networkPolicy.mongoEgressTo }}
+{{- fail "networkPolicy.mongoEgressTo must be set when networkPolicy.enabled=true" }}
+{{- end }}
+# Default-deny for the API pods, then allow only what the app needs:
+#   ingress: HTTP on the container port
+#   egress:  DNS and MongoDB
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "secureflight-api.fullname" . }}
+  labels:
+    {{- include "secureflight-api.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "secureflight-api.selectorLabels" . | nindent 6 }}
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - ports:
+        - port: {{ .Values.containerPort }}
+          protocol: TCP
+      {{- with .Values.networkPolicy.ingressFrom }}
+      from:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  egress:
+    - to:
+        {{- toYaml .Values.networkPolicy.dnsEgressTo | nindent 8 }}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    - to:
+        {{- toYaml .Values.networkPolicy.mongoEgressTo | nindent 8 }}
+      ports:
+        - port: {{ .Values.networkPolicy.mongoPort }}
+          protocol: TCP
+{{- end }}

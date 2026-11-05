@@ -1,0 +1,104 @@
+# Default values for secureflight-api.
+# CI/CD sets image.repository, image.tag and image.digest at deploy time.
+
+replicaCount: 2
+
+image:
+  # e.g. us-central1-docker.pkg.dev/<project>/<repo>/secureflight-api
+  repository: secureflight-api
+  # Git SHA of the build. Required; "latest" is rejected.
+  tag: ""
+  # Optional sha256 digest. When set, the pod pulls by digest (immutable);
+  # the tag is then only informational (labels, helm history).
+  digest: ""
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  create: true
+  # e.g. GKE Workload Identity:
+  #   iam.gke.io/gcp-service-account: <sa>@<project>.iam.gserviceaccount.com
+  annotations: {}
+  name: ""
+
+containerPort: 8000
+
+service:
+  type: ClusterIP
+  port: 80
+
+mongo:
+  # Database name (non-secret).
+  dbName: flights
+  # Existing Secret with the connection string. This chart and the pipeline
+  # never create it; it is provided by the infrastructure layer.
+  existingSecret: secureflight-api-mongo
+  existingSecretKey: MONGO_URI
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 256Mi
+
+probes:
+  # GET / returns 204 (liveness endpoint in api/main.py).
+  path: /
+  initialDelaySeconds: 5
+  periodSeconds: 10
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Spread replicas across nodes so the PDB protects against a node loss.
+topologySpread:
+  enabled: true
+  maxSkew: 1
+
+networkPolicy:
+  # Off by default because the Mongo destination depends on where the
+  # infrastructure layer runs it. The pipeline turns it on when the
+  # MONGO_EGRESS_CIDR variable is set.
+  enabled: false
+  # Sources allowed to reach the API on the container port.
+  # Empty = any pod in the cluster. When fronted by a GKE Ingress/Gateway with
+  # NEGs, also allow the Google health-check ranges 35.191.0.0/16 and 130.211.0.0/22.
+  ingressFrom: []
+  # Required when enabled: NetworkPolicy peers for MongoDB, e.g.
+  #   - ipBlock: {cidr: 10.10.1.0/24}
+  mongoEgressTo: []
+  mongoPort: 27017
+  # DNS: kube-dns, NodeLocal DNSCache, and Cloud DNS for GKE (metadata server).
+  dnsEgressTo:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: node-local-dns
+    - ipBlock:
+        cidr: 169.254.169.254/32
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

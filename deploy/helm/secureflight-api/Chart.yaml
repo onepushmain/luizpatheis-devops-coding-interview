@@ -1,0 +1,9 @@
+apiVersion: v2
+name: secureflight-api
+description: SecureFlight flights management API (FastAPI + MongoDB)
+type: application
+# Chart version: bump when templates change.
+version: 0.1.0
+# Static. The deployed commit is tracked by the image tag/digest, the
+# app.kubernetes.io/version label and the helm history description.
+appVersion: "0.1.0"
