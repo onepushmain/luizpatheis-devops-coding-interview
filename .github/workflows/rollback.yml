@@ -1,0 +1,154 @@
+# Manual rollback of the SecureFlight API Helm release on GKE.
+# Leave "revision" empty to roll back to the last good revision that ran a
+# different image than the one deployed now. See docs/ci-cd.md#rollback.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: Helm revision to roll back to (empty = last good revision with a different image)
+        required: false
+        type: string
+        default: ""
+      reason:
+        description: Why are you rolling back? (recorded in the run summary)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+# bash -eo pipefail: a failing command inside a pipe fails the step.
+defaults:
+  run:
+    shell: bash
+
+env:
+  HELM_RELEASE: secureflight-api
+  HELM_VERSION: v3.22.1
+
+jobs:
+  rollback:
+    name: Roll back release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # The production environment only allows the main branch (see docs), so this
+    # workflow cannot obtain deploy credentials when dispatched from another branch.
+    environment: production
+    # Same group as the deploy job in ci-cd.yml: a deploy and a rollback never run at the same time.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      NAMESPACE: ${{ vars.K8S_NAMESPACE }}
+      # Inputs go through env vars, never inline ${{ }} in scripts (injection-safe).
+      REVISION: ${{ inputs.revision }}
+      REASON: ${{ inputs.reason }}
+    steps:
+      - name: Validate input
+        run: |
+          if [ -n "$REVISION" ] && ! [[ "$REVISION" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::revision must be a positive integer or empty"
+            exit 1
+          fi
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Get GKE credentials
+        uses: google-github-actions/get-gke-credentials@3da1e46a907576cefaa90c484278bb5b259dd395 # v3.0.0
+        with:
+          cluster_name: ${{ vars.GKE_CLUSTER }}
+          location: ${{ vars.GKE_LOCATION }}
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+          use_dns_based_endpoint: true
+
+      - name: Set up Helm
+        uses: azure/setup-helm@9bc31f4ebc9c6b171d7bfbaa5d006ae7abdb4310 # v5.0.1
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Resolve target revision
+        id: target
+        run: |
+          helm history "$HELM_RELEASE" --namespace "$NAMESPACE" --max 10
+
+          image_of() {
+            helm get values "$HELM_RELEASE" --namespace "$NAMESPACE" --revision "$1" -o json \
+              | jq -r '"\(.image.tag)@\(.image.digest // "")"'
+          }
+
+          if [ -n "$REVISION" ]; then
+            target="$REVISION"
+          else
+            # "Previous" is not always "current - 1". Candidates are revisions older
+            # than the current one that were healthy ("superseded", or "deployed" when
+            # the current one is stuck in pending-*), excluding any revision that was
+            # itself rolled away from (the next revision's description is
+            # "Rollback to ..."), and running a different image than the current one.
+            current=$(helm status "$HELM_RELEASE" --namespace "$NAMESPACE" -o json | jq -r '.version')
+            if ! [[ "$current" =~ ^[0-9]+$ ]]; then
+              echo "::error::Could not read the current release revision (got '$current')."
+              exit 1
+            fi
+            current_image=$(image_of "$current")
+            candidates=$(helm history "$HELM_RELEASE" --namespace "$NAMESPACE" --max 10 -o json \
+              | jq -r --argjson cur "$current" '
+                  (map({key: (.revision | tostring), value: .description}) | from_entries) as $desc
+                  | [ .[]
+                      | select(.revision < $cur)
+                      | select(.status == "superseded" or .status == "deployed")
+                      | select((($desc[((.revision + 1) | tostring)] // "") | startswith("Rollback to")) | not)
+                      | .revision ]
+                  | reverse | .[]')
+            target=""
+            for rev in $candidates; do
+              if [ "$(image_of "$rev")" != "$current_image" ]; then target="$rev"; break; fi
+            done
+            if [ -z "$target" ]; then
+              echo "::error::No earlier good revision with a different image was found in the last 10 revisions."
+              exit 1
+            fi
+          fi
+          echo "Rolling back to revision $target ($(image_of "$target"))"
+          echo "revision=$target" >> "$GITHUB_OUTPUT"
+
+      - name: Helm rollback
+        env:
+          TARGET: ${{ steps.target.outputs.revision }}
+        run: |
+          helm rollback "$HELM_RELEASE" "$TARGET" \
+            --namespace "$NAMESPACE" \
+            --wait \
+            --timeout 5m \
+            --cleanup-on-fail \
+            --history-max 10
+
+      - name: Verify rollout
+        # The chart's fullname resolves to the release name, so the Deployment is named after it.
+        run: kubectl rollout status "deployment/$HELM_RELEASE" --namespace "$NAMESPACE" --timeout 120s
+
+      - name: Rollback summary
+        if: ${{ !cancelled() }}
+        env:
+          TARGET: ${{ steps.target.outputs.revision }}
+        run: |
+          # Code span keeps free-text input from rendering as Markdown.
+          safe_reason=$(printf '%s' "$REASON" | tr '`\n' "' ")
+          {
+            echo "### Rollback of \`$HELM_RELEASE\`"
+            echo "- Target revision: \`${TARGET:-unresolved}\`"
+            echo "- Triggered by: \`$GITHUB_ACTOR\`"
+            echo "- Reason: \`${safe_reason}\`"
+            echo
+            echo '```'
+            helm history "$HELM_RELEASE" --namespace "$NAMESPACE" --max 5 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
